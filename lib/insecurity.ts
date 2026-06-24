@@ -91,14 +91,14 @@ const tokenDenylist = new Set<string>()
 export const isTokenBlocked = (token: string) => Boolean(token) && tokenDenylist.has(utils.unquote(token))
 
 // [SECURITY FIX] Broken Authentication
-// Issue: (1) JWT verification did not pin the algorithm, so an attacker-controlled "alg" (alg=none, or HS256 signed with the public key) bypassed signature checks; (2) logged-out/denylisted tokens were still accepted.
-// Risk: CWE-347 (improper signature/algorithm verification) → token forgery & account takeover; CWE-613 → a logged-out/stolen token stayed valid until exp.
-// Fix: Pin algorithms:['RS256'] on the JWT middleware and reject denylisted tokens with 401 before delegating to it.
+// Issue: The pinned express-jwt@0.1.3 IGNORES the `algorithms` option, so the middleware did not actually enforce RS256; attacker-controlled "alg" (alg=none, or HS256 signed with the public key), as well as denylisted (logged-out) and expired tokens, were still accepted on protected routes.
+// Risk: CWE-347 (improper signature/algorithm verification) → token forgery & account takeover; CWE-613 → a logged-out or expired token stayed usable until its (previously unchecked) exp.
+// Fix: Gate every request on the hardened verify() (which enforces RS256, signature, expiry and the denylist) and reject with HTTP 401 BEFORE delegating. Genuine RS256 tokens still flow through express-jwt so req.user is populated exactly as before.
 export const isAuthorized = () => {
   const jwtMiddleware = expressJwt(({ secret: publicKey, algorithms: ['RS256'] }) as any)
   return (req: Request, res: Response, next: NextFunction) => {
     const token = utils.jwtFrom(req) || req.cookies?.token
-    if (token && isTokenBlocked(token)) {
+    if (token && !verify(token)) {
       res.status(401).json({ error: 'Unauthorized' })
       return
     }
@@ -112,15 +112,19 @@ export const denyAll = () => expressJwt({ secret: '' + Math.random() } as any)
 // Fix: Emit an explicit exp claim of 1 hour. NOTE: jsonwebtoken@0.4.0 does NOT honor the `expiresIn` string option (it sets no exp), so the 0.4.0-native `expiresInMinutes: 60` is used to actually produce exp = iat + 3600; the options are cast `as any` because @types/jsonwebtoken omits this legacy field. Algorithm RS256 retained; signing key now sourced from the environment.
 export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresInMinutes: 60, algorithm: 'RS256' } as any)
 // [SECURITY FIX] Broken Authentication
-// Issue: verify() trusted the token's self-declared algorithm (jws.verify with no pinned algorithm), so alg=none and HS256-signed-with-the-public-key forgeries passed.
-// Risk: CWE-347 — algorithm/signature confusion → token forgery.
-// Fix: Reject any token whose header alg is not RS256, then verify explicitly against the RS256 public key.
+// Issue: verify() (1) trusted the token's self-declared algorithm (jws.verify with no pinned algorithm), so alg=none and HS256-signed-with-the-public-key forgeries passed; (2) checked only the signature and never the `exp` claim, so expired RS256 tokens still returned true; (3) never consulted the logout denylist, so a logged-out token still verified for direct callers (currentUser, deluxe, 2fa, role helpers).
+// Risk: CWE-347 (algorithm/signature confusion → token forgery & account takeover); CWE-613 (expired or logged-out tokens remained usable until exp). verify() is the single hardened verifier reused by isAuthorized() and updateAuthenticatedUsers().
+// Fix: Reject, in order, (a) denylisted/logged-out tokens, (b) any token whose header alg is not RS256, (c) tokens that fail RS256 signature verification against the public key, and (d) tokens whose `exp` claim is missing or already in the past.
 export const verify = (token: string) => {
   if (!token) return false
+  if (isTokenBlocked(token)) return false
   try {
-    const algorithm = jws.decode(token)?.header?.alg
-    if (algorithm !== 'RS256') return false
-    return (jws.verify as ((token: string, secret: string) => boolean))(token, publicKey)
+    const decoded = jws.decode(token)
+    if (decoded?.header?.alg !== 'RS256') return false
+    if (!(jws.verify as ((token: string, secret: string) => boolean))(token, publicKey)) return false
+    const exp = (decoded?.payload as { exp?: number } | undefined)?.exp
+    if (typeof exp !== 'number' || exp <= Math.floor(Date.now() / 1000)) return false
+    return true
   } catch {
     return false
   }
@@ -278,12 +282,12 @@ export const appendUserId = () => {
 }
 
 // [SECURITY FIX] Broken Authentication
-// Issue: (1) jwt.verify did not pin the algorithm when populating the authenticated-user registry; (2) denylisted (logged-out) tokens were still cached/accepted.
-// Risk: CWE-347 token forgery via algorithm confusion; CWE-613 logged-out tokens remained usable.
-// Fix: Pin algorithms:['RS256'] and skip denylisted tokens.
+// Issue: The authenticated-user registry was populated via jwt.verify, but the pinned jsonwebtoken@0.4.0 IGNORES the `algorithms` option, so forged alg=none / HS256-with-public-key tokens (and denylisted or expired tokens) were decoded and cached as authenticated users — letting the app treat attacker-controlled payloads as logged-in users.
+// Risk: CWE-347 token forgery via algorithm confusion; CWE-613 logged-out/expired tokens remained usable.
+// Fix: Gate registry population on the hardened verify() (RS256 + signature + expiry + denylist). jwt.verify is now only ever reached with an already-verified RS256 token, which it merely decodes for caching.
 export const updateAuthenticatedUsers = () => (req: Request, res: Response, next: NextFunction) => {
   const token = req.cookies.token || utils.jwtFrom(req)
-  if (token && !isTokenBlocked(token) && authenticatedUsers.get(token) === undefined) {
+  if (token && verify(token) && authenticatedUsers.get(token) === undefined) {
     jwt.verify(token, publicKey, { algorithms: ['RS256'] } as any, (err: Error | null, decoded: any) => {
       if (err === null && decoded?.data !== undefined) {
         authenticatedUsers.put(token, decoded)
