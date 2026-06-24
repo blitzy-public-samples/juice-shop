@@ -595,14 +595,14 @@ function configureApp (app: ReturnType<typeof express>, seq: typeof sequelize) {
 
   /* Custom Restful API */
   app.post('/rest/user/login', login())
-  // [SECURITY FIX] Broken Authentication
-  // Issue: No server-side logout existed, so a JWT stayed valid until its exp claim even after the user "logged out" (logout was client-side only).
-  // Risk: CWE-613 (insufficient session expiration) — a stolen or forwarded token remained usable after logout, enabling session hijacking / account takeover.
-  // Fix: Expose POST /rest/user/logout so the presented token is invalidated server-side (added to the denylist and removed from the authenticated-user registry); subsequent requests bearing it are rejected with 401 by isAuthorized().
-  app.post('/rest/user/logout', logout())
   app.get('/rest/user/change-password', utils.asyncHandler(changePassword()))
   app.post('/rest/user/reset-password', utils.asyncHandler(resetPassword()))
   app.get('/rest/user/security-question', utils.asyncHandler(securityQuestion()))
+  // [SECURITY FIX] Broken Authentication
+  // Issue: Logout was client-side only; a JWT remained valid server-side until its (formerly 6h) expiry, so a stolen/forwarded token could not be revoked.
+  // Risk: Session/token theft (CWE-613) — a captured token stayed usable after the user "logged out", enabling account takeover for the token's lifetime.
+  // Fix: Expose POST /rest/user/logout (auth-gated) which adds the presented token to the server-side denylist and removes it from the authenticated-user registry, so subsequent use is rejected with 401.
+  app.post('/rest/user/logout', security.isAuthorized(), utils.asyncHandler(logout()))
   app.get('/rest/user/whoami', utils.asyncHandler(retrieveLoggedInUser()))
   app.get('/rest/user/authentication-details', utils.asyncHandler(authenticatedUsers()))
   app.get('/rest/products/search', utils.asyncHandler(searchProducts()))
