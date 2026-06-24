@@ -31,10 +31,15 @@ export function login () {
 
   return (req: Request, res: Response, next: NextFunction) => {
     verifyPreLoginChallenges(req) // vuln-code-snippet hide-line
-    models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND password = '${security.hash(req.body.password || '')}' AND deletedAt IS NULL`, { model: UserModel, plain: true }) // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge
+    // [SECURITY FIX] Broken Authentication
+    // Issue: The login query embedded security.hash(password) (MD5) directly in the SQL WHERE clause to match credentials; password storage now uses bcrypt, so an MD5 value can never equal a stored bcrypt hash and every login fails.
+    // Risk: CWE-327/CWE-916 — password verification via a broken, unsalted, fast MD5 hash, plus a storage/verification hash-format mismatch that breaks authentication.
+    // Fix: Retrieve the account by email only, then verify the supplied password against the stored bcrypt hash with security.comparePassword().
+    models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND deletedAt IS NULL`, { model: UserModel, plain: true }) // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge
       .then((authenticatedUser) => { // vuln-code-snippet neutral-line loginAdminChallenge loginBenderChallenge loginJimChallenge
         const user = utils.queryResultToJson(authenticatedUser)
-        if (user.data?.id && user.data.totpSecret !== '') {
+        const passwordValid = Boolean(user.data?.id) && security.comparePassword(req.body.password || '', user.data?.password ?? '')
+        if (user.data?.id && passwordValid && user.data.totpSecret !== '') {
           res.status(401).json({
             status: 'totp_token_required',
             data: {
@@ -44,7 +49,7 @@ export function login () {
               })
             }
           })
-        } else if (user.data?.id) {
+        } else if (user.data?.id && passwordValid) {
           afterLogin(user.data, res, next)
         } else {
           res.status(401).send(res.__('Invalid email or password.'))

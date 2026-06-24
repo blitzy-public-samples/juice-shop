@@ -104,7 +104,11 @@ export async function setup (req: Request, res: Response) {
 
     const { password, setupToken, initialToken } = req.body
 
-    if (user.password !== security.hash(password)) {
+    // [SECURITY FIX] Broken Authentication
+    // Issue: 2FA setup verified the account password by comparing security.hash(password) (MD5) to the stored password, which is now a bcrypt hash — so the check can never pass.
+    // Risk: CWE-327/CWE-916 — MD5-based password comparison and a storage/verification hash-format mismatch.
+    // Fix: Verify the supplied password against the stored bcrypt hash with security.comparePassword().
+    if (!security.comparePassword(password, user.password)) {
       throw new Error('Password doesnt match stored password')
     }
 
@@ -149,7 +153,11 @@ export async function disable (req: Request, res: Response) {
 
     const { password } = req.body
 
-    if (user.password !== security.hash(password)) {
+    // [SECURITY FIX] Broken Authentication
+    // Issue: Disabling 2FA verified the account password by comparing security.hash(password) (MD5) to the stored password, which is now a bcrypt hash — so the check can never pass.
+    // Risk: CWE-327/CWE-916 — MD5-based password comparison and a storage/verification hash-format mismatch.
+    // Fix: Verify the supplied password against the stored bcrypt hash with security.comparePassword().
+    if (!security.comparePassword(password, user.password)) {
       throw new Error('Password doesnt match stored password')
     }
 

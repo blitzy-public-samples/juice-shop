@@ -36,7 +36,11 @@ export function changePassword () {
       return
     }
 
-    if (currentPassword && security.hash(currentPassword) !== loggedInUser.data.password) {
+    // [SECURITY FIX] Broken Authentication
+    // Issue: The current password was verified by comparing security.hash(currentPassword) (MD5) to the stored password, which is now a bcrypt hash — so the check can never pass for a legitimate user.
+    // Risk: CWE-327/CWE-916 — MD5-based password comparison and a storage/verification hash-format mismatch that breaks re-authentication on password change.
+    // Fix: Verify the supplied current password against the stored bcrypt hash with security.comparePassword().
+    if (currentPassword && !security.comparePassword(currentPassword, loggedInUser.data.password)) {
       res.status(401).send(res.__('Current password is not correct.'))
       return
     }

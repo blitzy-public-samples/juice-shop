@@ -72,8 +72,12 @@ const UserModelInit = (sequelize: Sequelize) => { // vuln-code-snippet start wea
       }, // vuln-code-snippet hide-end
       password: {
         type: DataTypes.STRING,
+        // [SECURITY FIX] Broken Authentication
+        // Issue: User passwords were stored using fast, unsalted MD5 (security.hash).
+        // Risk: CWE-327/CWE-916 — offline brute-force / rainbow-table cracking enabling mass credential compromise.
+        // Fix: Store a bcrypt hash at cost factor 12 via security.hashPassword().
         set (clearTextPassword: string) {
-          this.setDataValue('password', security.hash(clearTextPassword)) // vuln-code-snippet vuln-line weakPasswordChallenge
+          this.setDataValue('password', security.hashPassword(clearTextPassword)) // vuln-code-snippet vuln-line weakPasswordChallenge
         }
       }, // vuln-code-snippet end weakPasswordChallenge
       role: {

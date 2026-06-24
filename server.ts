@@ -66,6 +66,7 @@ import datacreator from './data/datacreator'
 import locales from './data/static/locales.json'
 
 import { login } from './routes/login'
+import { logout } from './routes/logout'
 import * as verify from './routes/verify'
 import * as address from './routes/address'
 import * as metrics from './routes/metrics'
@@ -594,6 +595,11 @@ function configureApp (app: ReturnType<typeof express>, seq: typeof sequelize) {
 
   /* Custom Restful API */
   app.post('/rest/user/login', login())
+  // [SECURITY FIX] Broken Authentication
+  // Issue: No server-side logout existed, so a JWT stayed valid until its exp claim even after the user "logged out" (logout was client-side only).
+  // Risk: CWE-613 (insufficient session expiration) — a stolen or forwarded token remained usable after logout, enabling session hijacking / account takeover.
+  // Fix: Expose POST /rest/user/logout so the presented token is invalidated server-side (added to the denylist and removed from the authenticated-user registry); subsequent requests bearing it are rejected with 401 by isAuthorized().
+  app.post('/rest/user/logout', logout())
   app.get('/rest/user/change-password', utils.asyncHandler(changePassword()))
   app.post('/rest/user/reset-password', utils.asyncHandler(resetPassword()))
   app.get('/rest/user/security-question', utils.asyncHandler(securityQuestion()))
