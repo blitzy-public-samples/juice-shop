@@ -20,12 +20,15 @@ This file provides context for the Junie AI assistant (JetBrains) when contribut
 
 ### Newly required environment variables
 Documented with placeholder values in **`/.env.example`**:
-- **`JWT_PRIVATE_KEY`** *(required)* — RSA private key used to sign session JWTs. **`JWT_PRIVATE_KEY_PATH`** is an optional file/path fallback so local/dev boots still succeed when the inline variable is unset.
-- **`HMAC_SECRET`** *(required)* — secret for HMAC operations.
-- **`ADMIN_PASSWORD`** *(optional)* — overrides the seeded admin password; falls back to the seed value when unset.
-- **`COOKIE_SECRET`** *(optional)* — externalizes the cookie-parser secret.
+- **`JWT_PRIVATE_KEY`** *(required, wired)* — RSA private key used to sign session JWTs. Read by `lib/insecurity.ts`. **`JWT_PRIVATE_KEY_PATH`** is an optional file/path fallback (also read by `lib/insecurity.ts`) so local/dev boots still succeed when the inline variable is unset.
+- **`HMAC_SECRET`** *(required, wired)* — secret for HMAC operations. Read by `lib/insecurity.ts` (`hmac()`).
 
-These variables must be provisioned before/with deployment. The JWT key file/path fallback prevents local boot failure when the inline variable is absent.
+The two variables above are the only auth-related variables consumed by the current code. The required `JWT_PRIVATE_KEY`/`HMAC_SECRET` must be provisioned before/with deployment; the JWT key file/path fallback prevents local boot failure when the inline variable is absent.
+
+#### Documented placeholders — NOT wired in this checkpoint
+The following entries appear in `/.env.example` as forward-looking placeholders only. **No current code reads them**, so they require no provisioning and changing them has no runtime effect today. They are documented so a future, separately scoped change can wire them up:
+- **`ADMIN_PASSWORD`** *(optional, not yet wired)* — reserved to override the seeded admin password at deploy time. Not consumed by code: the seed value in `data/static/users.yml` (`admin123`) is still used as-is.
+- **`COOKIE_SECRET`** *(optional, not yet wired)* — reserved to externalize the cookie-parser secret. Not consumed by code: `server.ts` still uses the in-source `cookieParser('kekse')` secret.
 
 ### Summary of fixes
 - **JWT hardening:** signing key externalized to the environment; `RS256` pinned at all verification sites; access-token lifetime reduced from **6h → 1h**.
@@ -37,7 +40,8 @@ These variables must be provisioned before/with deployment. The JWT key file/pat
 ### Existing tests requiring updates (NOT edited by this work)
 These assert the now-fixed vulnerable behavior and must be updated separately:
 - **Server unit:** `test/server/insecurity.unit.test.ts`, `test/server/verify.unit.test.ts`, `test/server/currentUser.unit.test.ts`, `test/server/saveLoginIp.unit.test.ts`
-- **API:** `test/api/login.test.ts`, `test/api/password.test.ts`, `test/api/2fa.test.ts`, `test/api/authenticated-users.test.ts`, `test/api/user.test.ts`, `test/api/user-profile.test.ts`, `test/api/helpers/auth.ts`
+- **API:** `test/api/login.test.ts`, `test/api/password.test.ts`, `test/api/2fa.test.ts`, `test/api/authenticated-users.test.ts`, `test/api/user.test.ts`, `test/api/user-profile.test.ts`, `test/api/helpers/auth.ts`, `test/api/basket.test.ts`, `test/api/search.test.ts`, `test/api/security-question.test.ts`
+    - *Observed failing in a full `npm run test:api` run (546 pass / 10 fail), because they assert the now-fixed vulnerable behavior:* `basket.test.ts` (`GET /rest/basket/:id` "should accept forged JWTs" — forged tokens are now rejected by RS256 pinning); `search.test.ts` (`GET /rest/products/search` UNION-SELECT that leaks the password-hash column — passwords are now bcrypt, so the asserted MD5 hash format no longer holds); `security-question.test.ts` (`GET /rest/user/security-question` "returns nothing for an unknown email address" — the endpoint now returns a deterministic decoy `{ question }` to prevent enumeration). The remaining observed failures fall under already-listed files: `login.test.ts` (SQL-injection login attacks), `password.test.ts` (change-password for Bender without the current password), and `authenticated-users.test.ts` (password column masked).
 - **Cypress E2E:** `test/cypress/e2e/login.spec.ts`, `test/cypress/e2e/changePassword.spec.ts`, `test/cypress/e2e/forgotPassword.spec.ts`, `test/cypress/e2e/passwordHashLeak.spec.ts`, `test/cypress/e2e/forgedJwt.spec.ts`, `test/cypress/e2e/register.spec.ts`, `test/cypress/e2e/totpSetup.spec.ts`
 
 ### CTF challenges neutralized by the fixes
