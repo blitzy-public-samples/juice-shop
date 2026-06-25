@@ -7,6 +7,9 @@ import { describe, it, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import * as security from '../../lib/insecurity'
 import { login } from '../../routes/login'
+import { securityQuestion } from '../../routes/securityQuestion'
+import { SecurityQuestionModel } from '../../models/securityQuestion'
+import { SecurityAnswerModel } from '../../models/securityAnswer'
 import * as models from '../../models/index'
 import type { UserModel } from '@juice-shop/models/user'
 
@@ -83,6 +86,40 @@ void describe('[Security Fix] Broken Authentication - lib/insecurity', () => {
       // ...but once logged out it must be rejected at the verify() entry point used by direct callers.
       security.invalidate(token)
       assert.equal(security.verify(token), false)
+    })
+  })
+
+  void describe('authenticatedUsers.get()/from() re-validate cached tokens (no stale acceptance)', () => {
+    // Regression coverage for the registry stale-cache defect: once a token is cached by
+    // updateAuthenticatedUsers(), the read paths (get / from / appendUserId) MUST re-validate it via the
+    // hardened verify() and evict it when it no longer holds, so an expired or logged-out token can never be
+    // served from cache after verify() would reject it. put() performs no verification, so it faithfully
+    // models a registry entry that was cached while valid and has since gone stale.
+    void it('get() refuses and evicts a cached token whose signature/exp no longer verifies (expired)', () => {
+      security.authenticatedUsers.put(expiredRs256Token, { data: { id: 90010, email: 'stale-expired@juice-sh.op' } as unknown as UserModel })
+      // A registry read must re-validate and refuse the stale (expired) entry...
+      assert.equal(security.authenticatedUsers.get(expiredRs256Token), undefined)
+      // ...and must have evicted it so it cannot be served on a subsequent read.
+      assert.equal(security.authenticatedUsers.tokenMap[expiredRs256Token], undefined)
+    })
+
+    void it('get() refuses and evicts a denylisted (logged-out) token still lingering in the registry', () => {
+      const token = security.authorize({ data: { id: 90011, email: 'stale-denylisted@juice-sh.op' } })
+      // The genuine token verifies before logout...
+      assert.equal(security.verify(token), true)
+      // ...then logout denylists (and drops) it; we re-insert to simulate a stale cached entry surviving logout.
+      security.invalidate(token)
+      security.authenticatedUsers.put(token, { data: { id: 90011, email: 'stale-denylisted@juice-sh.op' } as unknown as UserModel })
+      assert.equal(security.verify(token), false)
+      assert.equal(security.authenticatedUsers.get(token), undefined)
+      assert.equal(security.authenticatedUsers.tokenMap[token], undefined)
+    })
+
+    void it('from() delegates to the re-validating get() and rejects a stale cached token from the request', () => {
+      security.authenticatedUsers.put(expiredRs256Token, { data: { id: 90012, email: 'stale-from@juice-sh.op' } as unknown as UserModel })
+      const req: any = { headers: { authorization: `Bearer ${expiredRs256Token}` } }
+      assert.equal(security.authenticatedUsers.from(req), undefined)
+      assert.equal(security.authenticatedUsers.tokenMap[expiredRs256Token], undefined)
     })
   })
 
@@ -200,5 +237,61 @@ void describe('[Security Fix] Broken Authentication - lib/insecurity', () => {
       assert.equal(sentMessage, 'Invalid email or password.')
       assert.equal(nextCalls, 0)
     })
+  })
+})
+
+void describe('[Security Fix] Broken Authentication - securityQuestion (no enumeration via DB access pattern)', () => {
+  // Finding #5: the response shape was already uniform, but the registered and unregistered branches performed
+  // a different number/type of database lookups, leaving a query-count/latency enumeration oracle. The fix makes
+  // BOTH branches run count() + findByPk() exactly once. These tests mock the models and assert the query
+  // pattern (which methods, how many times) is identical for a known vs an unknown email.
+  const invoke = async (email: string, answerValue: unknown) => {
+    const answerFindOne = mock.method(SecurityAnswerModel, 'findOne', async () => answerValue)
+    const questionCount = mock.method(SecurityQuestionModel, 'count', async () => 5)
+    const questionFindByPk = mock.method(SecurityQuestionModel, 'findByPk', async (id: number) => ({ id, question: `Question ${id}` }))
+    const questionFindOne = mock.method(SecurityQuestionModel, 'findOne', async () => ({ id: 1, question: 'Question 1' }))
+    let body: { question?: unknown } | undefined
+    const req: any = { query: { email } }
+    const res: any = { json (payload: { question?: unknown }) { body = payload; return this } }
+    const next = mock.fn()
+
+    await securityQuestion()(req, res, next)
+
+    const counts = {
+      answerFindOne: answerFindOne.mock.calls.length,
+      questionCount: questionCount.mock.calls.length,
+      questionFindByPk: questionFindByPk.mock.calls.length,
+      questionFindOne: questionFindOne.mock.calls.length,
+      next: next.mock.calls.length
+    }
+    answerFindOne.mock.restore()
+    questionCount.mock.restore()
+    questionFindByPk.mock.restore()
+    questionFindOne.mock.restore()
+    return { body, counts }
+  }
+
+  void it('uses an identical query pattern and { question } response shape for known and unknown emails', async () => {
+    const known = await invoke('known@juice-sh.op', { SecurityQuestionId: 3 })
+    const unknown = await invoke('unknown@juice-sh.op', null)
+
+    // The query pattern (which model methods, and how many times) must be identical so that neither the query
+    // count nor the resulting latency can reveal whether the email is registered.
+    assert.deepEqual(known.counts, unknown.counts)
+    // Both branches go through count() + findByPk() exactly once and never the asymmetric findOne() path.
+    assert.equal(known.counts.questionCount, 1)
+    assert.equal(known.counts.questionFindByPk, 1)
+    assert.equal(known.counts.questionFindOne, 0)
+    // Both responses carry the same { question } shape with a real question object.
+    assert.ok(Object.prototype.hasOwnProperty.call(known.body, 'question'))
+    assert.ok(Object.prototype.hasOwnProperty.call(unknown.body, 'question'))
+    assert.equal(typeof (known.body as { question: { question: string } }).question.question, 'string')
+    assert.equal(typeof (unknown.body as { question: { question: string } }).question.question, 'string')
+  })
+
+  void it('derives a deterministic decoy question for the same unknown email', async () => {
+    const first = await invoke('stable.unknown@juice-sh.op', null)
+    const second = await invoke('stable.unknown@juice-sh.op', null)
+    assert.deepEqual(first.body, second.body)
   })
 })

@@ -14,8 +14,10 @@ let app: Express
 let domain: string
 let knownEmail: string
 let logoutEmail: string
+let registryLogoutEmail: string
 const knownPassword = 'Sup3rStr0ngPass1'
 const logoutPassword = 'An0therStr0ngPass1'
+const registryLogoutPassword = 'Th1rdStr0ngPass1'
 const jsonHeader = { 'content-type': 'application/json' }
 
 // [Security Fix] Broken Authentication — SC1 forged/expired JWT fixtures (reused verbatim from
@@ -34,7 +36,11 @@ before(async () => {
   domain = config.get<string>('application.domain')
   knownEmail = `authsecfix.known@${domain}`
   logoutEmail = `authsecfix.logout@${domain}`
-  // Assert both seed registrations succeed (HTTP 201) before the suites run, so any setup breakage
+  // A DEDICATED account, used only by the appendUserId-gated logout test below, so its token is never
+  // shared with another logout test. (JWT `iat` is second-granular, so the same user logging in twice within
+  // the same second yields the SAME token; a dedicated account guarantees a distinct, non-denylisted token.)
+  registryLogoutEmail = `authsecfix.registrylogout@${domain}`
+  // Assert all seed registrations succeed (HTTP 201) before the suites run, so any setup breakage
   // surfaces here with an actionable diagnostic instead of as confusing downstream login failures.
   const knownRegistration = await request(app)
     .post('/api/Users')
@@ -46,6 +52,11 @@ before(async () => {
     .set(jsonHeader)
     .send({ email: logoutEmail, password: logoutPassword })
   assert.equal(logoutRegistration.status, 201)
+  const registryLogoutRegistration = await request(app)
+    .post('/api/Users')
+    .set(jsonHeader)
+    .send({ email: registryLogoutEmail, password: registryLogoutPassword })
+  assert.equal(registryLogoutRegistration.status, 201)
 }, { timeout: 60000 })
 
 void describe('[Security Fix] Broken Authentication - login (hashing + enumeration)', () => {
@@ -134,6 +145,32 @@ void describe('[Security Fix] Broken Authentication - server-side logout (token 
     assert.equal(logoutRes.status, 200)
 
     const afterLogout = await request(app).get('/api/Users').set(authHeader)
+    assert.equal(afterLogout.status, 401)
+  })
+
+  void it('rejects a logged-out token on an appendUserId-gated route (registry read path) with 401', async () => {
+    // GET /api/Addresss is gated ONLY by security.appendUserId() (server.ts), so its authentication is
+    // enforced solely by the registry read path hardened for finding #3 (appendUserId -> authenticatedUsers.get()).
+    // This exercises that specific path end-to-end through the real middleware stack.
+    const loginRes = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: registryLogoutEmail, password: registryLogoutPassword })
+    assert.equal(loginRes.status, 200)
+    const token = loginRes.body.authentication.token
+    assert.equal(typeof token, 'string')
+
+    const authHeader = { Authorization: `Bearer ${token}` }
+
+    // While authenticated, the appendUserId-gated route resolves the user from the registry and returns 200.
+    const beforeLogout = await request(app).get('/api/Addresss').set(authHeader)
+    assert.equal(beforeLogout.status, 200)
+
+    // After logout the token is denylisted and evicted, so the registry read (get()) refuses it -> 401.
+    const logoutRes = await request(app).post('/rest/user/logout').set(authHeader)
+    assert.equal(logoutRes.status, 200)
+
+    const afterLogout = await request(app).get('/api/Addresss').set(authHeader)
     assert.equal(afterLogout.status, 401)
   })
 })

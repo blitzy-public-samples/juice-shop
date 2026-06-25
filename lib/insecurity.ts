@@ -18,29 +18,47 @@ import * as utils from './utils'
 // @ts-expect-error FIXME no typescript definitions for z85 :(
 import * as z85 from 'z85'
 
-export const publicKey = fs ? fs.readFileSync('encryptionkeys/jwt.pub', 'utf8') : 'placeholder-public-key'
 // [SECURITY FIX] Broken Authentication
-// Issue: The RSA private signing key was hardcoded inline in source, and its public half is browsable at /encryptionkeys/jwt.pub.
-// Risk: CWE-321/CWE-798 — anyone with source access can sign arbitrary JWTs and impersonate any user (incl. admin) → full account takeover.
-// Fix: Load the private key from JWT_PRIVATE_KEY (normalizing literal \n), else JWT_PRIVATE_KEY_PATH, else a local key file; the prior literal remains only as a last-resort dev/test fallback so the app still boots. Production provides the key via the environment.
-const loadPrivateKey = (): string => {
+// Issue: The RSA private signing key was hardcoded inline in source (its public half is browsable at /encryptionkeys/jwt.pub), and the prior remediation kept that exact secret as an operative runtime fallback, so the app could still sign valid JWTs from a committed key with no environment configured.
+// Risk: CWE-321/CWE-798 — a committed signing key lets anyone with source/repo access forge a token for any user (incl. admin) → full account takeover; keeping it as a fallback leaves the secret operative in production.
+// Fix: Remove the committed private key entirely. Source the signing key ONLY from the environment (JWT_PRIVATE_KEY, normalizing literal \n) or a key file (JWT_PRIVATE_KEY_PATH / an uncommitted encryptionkeys/jwt.key). When none is configured the app FAILS CLOSED in production; outside production it generates a throwaway EPHEMERAL RSA key pair (never the original secret, regenerated each boot) so local/dev/test still boot. The verification public key is ALWAYS DERIVED from the active private key (crypto.createPublicKey), so any operator-supplied key works and signing/verification can never be configured with a mismatched pair (the committed jwt.pub is no longer assumed to match the signing key).
+const loadKeyMaterial = (): { privateKey: string, publicKey: string } => {
+  // Derive the verification public key directly from whatever private key is active, so signing (authorize)
+  // and verification (verify/isAuthorized/updateAuthenticatedUsers) always use a matching pair regardless of
+  // which key the operator provides — eliminating the mismatched private/public key deployment failure mode.
+  const fromPrivateKey = (privateKeyPem: string) => ({
+    privateKey: privateKeyPem,
+    publicKey: crypto.createPublicKey(privateKeyPem).export({ type: 'spki', format: 'pem' }).toString()
+  })
   // 1) Inline PEM supplied via the environment (production). Normalize literal "\n" sequences to real newlines.
   if (process.env.JWT_PRIVATE_KEY !== undefined && process.env.JWT_PRIVATE_KEY !== '') {
-    return process.env.JWT_PRIVATE_KEY.replace(/\\n/g, '\n')
+    return fromPrivateKey(process.env.JWT_PRIVATE_KEY.replace(/\\n/g, '\n'))
   }
   // 2) Path to a PEM file on disk supplied via the environment.
   if (process.env.JWT_PRIVATE_KEY_PATH !== undefined && process.env.JWT_PRIVATE_KEY_PATH !== '') {
-    return fs.readFileSync(process.env.JWT_PRIVATE_KEY_PATH, 'utf8')
+    return fromPrivateKey(fs.readFileSync(process.env.JWT_PRIVATE_KEY_PATH, 'utf8'))
   }
-  // 3) Conventional local key file, if present (not committed to the repository).
+  // 3) Conventional local key file, if present (developer-supplied, NOT committed to the repository).
   if (fs.existsSync('encryptionkeys/jwt.key')) {
-    return fs.readFileSync('encryptionkeys/jwt.key', 'utf8')
+    return fromPrivateKey(fs.readFileSync('encryptionkeys/jwt.key', 'utf8'))
   }
-  // 4) Last-resort dev/test fallback: the prior inline literal, retained ONLY so local/dev/test boots
-  //    still succeed without configuration. It is no longer the primary/sole source and is rotatable.
-  return '-----BEGIN RSA PRIVATE KEY-----\r\nMIICXAIBAAKBgQDNwqLEe9wgTXCbC7+RPdDbBbeqjdbs4kOPOIGzqLpXvJXlxxW8iMz0EaM4BKUqYsIa+ndv3NAn2RxCd5ubVdJJcX43zO6Ko0TFEZx/65gY3BE0O6syCEmUP4qbSd6exou/F+WTISzbQ5FBVPVmhnYhG/kpwt/cIxK5iUn5hm+4tQIDAQABAoGBAI+8xiPoOrA+KMnG/T4jJsG6TsHQcDHvJi7o1IKC/hnIXha0atTX5AUkRRce95qSfvKFweXdJXSQ0JMGJyfuXgU6dI0TcseFRfewXAa/ssxAC+iUVR6KUMh1PE2wXLitfeI6JLvVtrBYswm2I7CtY0q8n5AGimHWVXJPLfGV7m0BAkEA+fqFt2LXbLtyg6wZyxMA/cnmt5Nt3U2dAu77MzFJvibANUNHE4HPLZxjGNXN+a6m0K6TD4kDdh5HfUYLWWRBYQJBANK3carmulBwqzcDBjsJ0YrIONBpCAsXxk8idXb8jL9aNIg15Wumm2enqqObahDHB5jnGOLmbasizvSVqypfM9UCQCQl8xIqy+YgURXzXCN+kwUgHinrutZms87Jyi+D8Br8NY0+Nlf+zHvXAomD2W5CsEK7C+8SLBr3k/TsnRWHJuECQHFE9RA2OP8WoaLPuGCyFXaxzICThSRZYluVnWkZtxsBhW2W8z1b8PvWUE7kMy7TnkzeJS2LSnaNHoyxi7IaPQUCQCwWU4U+v4lD7uYBw00Ga/xt+7+UqFPlPVdz1yyr4q24Zxaw0LgmuEvgU5dycq8N7JxjTubX0MIRR+G9fmDBBl8=\r\n-----END RSA PRIVATE KEY-----'
+  // 4) Production with no configured key: FAIL CLOSED rather than fall back to any embedded secret.
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('JWT signing key is not configured. Set JWT_PRIVATE_KEY or JWT_PRIVATE_KEY_PATH (or provide an uncommitted encryptionkeys/jwt.key) before starting in production.')
+  }
+  // 5) Local/dev/test fallback: generate a throwaway EPHEMERAL RSA key pair (regenerated every boot; never the
+  //    original committed secret). Both halves stay in-process so authorize()/verify() remain mutually consistent.
+  const ephemeral = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+    publicKeyEncoding: { type: 'spki', format: 'pem' }
+  })
+  console.warn('[insecurity] No JWT signing key configured (JWT_PRIVATE_KEY / JWT_PRIVATE_KEY_PATH / encryptionkeys/jwt.key); generated an EPHEMERAL development/test key pair. Tokens will not survive a restart — configure a key for any non-local use.')
+  return { privateKey: ephemeral.privateKey, publicKey: ephemeral.publicKey }
 }
-const privateKey = loadPrivateKey()
+const keyMaterial = loadKeyMaterial()
+export const publicKey = keyMaterial.publicKey
+const privateKey = keyMaterial.privateKey
 
 interface ResponseWithUser {
   status?: string
@@ -63,10 +81,25 @@ interface IAuthenticatedUsers {
 
 export const hash = (data: string) => crypto.createHash('md5').update(data).digest('hex')
 // [SECURITY FIX] Broken Authentication
-// Issue: The HMAC secret used to hash security answers was hardcoded inline in source.
-// Risk: CWE-798 — a known, source-embedded secret lets anyone forge/precompute security-answer HMACs.
-// Fix: Source the secret from process.env.HMAC_SECRET, retaining the prior string only as a non-secret dev fallback for identical local/test behavior.
-export const hmac = (data: string) => crypto.createHmac('sha256', process.env.HMAC_SECRET ?? 'pa4qacea4VK9t9nGv7yZtwmj').update(data).digest('hex')
+// Issue: The HMAC secret used to hash security answers was hardcoded inline in source and was kept as an operative `?? 'pa4qacea4VK9t9nGv7yZtwmj'` fallback, so the original committed secret stayed in effect whenever HMAC_SECRET was unset.
+// Risk: CWE-798 — a known, source-embedded secret lets anyone forge/precompute security-answer HMACs; an always-on fallback leaves it operative in production.
+// Fix: Source the secret from process.env.HMAC_SECRET. When it is unset, FAIL CLOSED everywhere except: NODE_ENV==='test' uses the prior literal as a non-production, test-only gated fixture (so deterministic test vectors hold), and other non-production runs use a throwaway random per-boot secret. The committed secret is therefore never operative in production/default runtime.
+const resolveHmacSecret = (): string => {
+  if (process.env.HMAC_SECRET !== undefined && process.env.HMAC_SECRET !== '') {
+    return process.env.HMAC_SECRET
+  }
+  if (process.env.NODE_ENV === 'test') {
+    // Test-only gated fixture (explicitly NOT used in production/default runtime).
+    return 'pa4qacea4VK9t9nGv7yZtwmj'
+  }
+  if (process.env.NODE_ENV !== 'production') {
+    // Local/dev: throwaway random secret (never the committed value); regenerated each boot.
+    return crypto.randomBytes(32).toString('hex')
+  }
+  throw new Error('HMAC_SECRET is not configured. Set process.env.HMAC_SECRET before starting in production.')
+}
+const hmacSecret = resolveHmacSecret()
+export const hmac = (data: string) => crypto.createHmac('sha256', hmacSecret).update(data).digest('hex')
 
 // [SECURITY FIX] Broken Authentication
 // Issue: Passwords were stored/compared with fast, unsalted MD5 (security.hash).
@@ -150,8 +183,19 @@ export const authenticatedUsers: IAuthenticatedUsers = {
     this.tokenMap[token] = user
     this.idMap[user.data.id] = token
   },
+  // [SECURITY FIX] Broken Authentication
+  // Issue: get() (and from(), which delegates to it) returned a cached user straight from the registry without re-checking the token, so a token cached by updateAuthenticatedUsers() before it expired — or one later denylisted via logout — was still accepted by registry-backed routes even though verify() returns false.
+  // Risk: CWE-613 — expired or logged-out tokens remained usable through cached registry reads, creating a split-brain auth model where verify() rejects a token while registry consumers accept it.
+  // Fix: Re-validate the token through the hardened verify() (RS256 + signature + expiry + denylist) on every read and evict the stale entry when it fails, so registry reads enforce the same expiry/denylist semantics as verify().
   get: function (token?: string) {
-    return token ? this.tokenMap[utils.unquote(token)] : undefined
+    if (!token) return undefined
+    const user = this.tokenMap[utils.unquote(token)]
+    if (user === undefined) return undefined
+    if (!verify(token)) {
+      this.delete(token)
+      return undefined
+    }
+    return user
   },
   tokenOf: function (user: UserModel) {
     return user ? this.idMap[user.id] : undefined
@@ -164,8 +208,10 @@ export const authenticatedUsers: IAuthenticatedUsers = {
     const token = utils.jwtFrom(req)
     this.put(token, user)
   },
-  // Additive registry support for server-side logout (see invalidate() below). Because put() stores under
-  // the raw token while get() reads the unquoted token, remove BOTH forms defensively and clear the idMap entry.
+  // [SECURITY FIX] Broken Authentication
+  // Issue: The authenticated-user registry exposed put/get/tokenOf/from/updateFrom but had NO eviction method, so server-side logout could not drop a session and stale/expired entries lingered indefinitely.
+  // Risk: CWE-613 — without eviction a logged-out or expired token's cached user remained in the registry and could keep being served to registry-backed routes after it should have been invalid.
+  // Fix: Add delete() so invalidate()/logout and the hardened get() re-validation path can evict an entry. Because put() stores under the raw token while get() reads the unquoted token, remove BOTH forms defensively and clear the idMap entry.
   delete: function (token: string) {
     const unquoted = utils.unquote(token)
     const user = this.tokenMap[unquoted] ?? this.tokenMap[token]
@@ -270,10 +316,18 @@ export const isCustomer = (req: Request) => {
   return decodedToken?.data?.role === roles.customer
 }
 
+// [SECURITY FIX] Broken Authentication
+// Issue: appendUserId() read the user id straight from authenticatedUsers.tokenMap, bypassing the hardened get(), so an expired or logged-out token still cached in the registry was accepted and its UserId attached to the request.
+// Risk: CWE-613 — a stale/expired/denylisted token could still authorize basket/order writes via this middleware even though verify() rejects it everywhere else.
+// Fix: Resolve the user through authenticatedUsers.get(), which re-validates the token via verify() (RS256 + signature + expiry + denylist) and evicts stale entries; an invalid token yields undefined, so the existing catch returns HTTP 401 exactly as before.
 export const appendUserId = () => {
   return (req: Request, res: Response, next: NextFunction) => {
     try {
-      req.body.UserId = authenticatedUsers.tokenMap[utils.jwtFrom(req)].data.id
+      const user = authenticatedUsers.get(utils.jwtFrom(req))
+      if (user === undefined) {
+        throw new Error('Unauthenticated request')
+      }
+      req.body.UserId = user.data.id
       next()
     } catch (error: unknown) {
       res.status(401).json({ status: 'error', message: utils.getErrorMessage(error) })
