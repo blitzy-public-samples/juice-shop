@@ -134,6 +134,45 @@ void describe('[Security Fix] Broken Authentication - lib/insecurity', () => {
       assert.ok(lifetimeSeconds > 0)
       assert.ok(lifetimeSeconds <= 3600)
     })
+
+    // Regression for QA Issue #2 (SC5 edge case): jsonwebtoken@0.4.0 derives the token solely from the
+    // payload + a second-granularity iat, so two authorize() calls with an identical payload within the same
+    // second used to produce a BYTE-IDENTICAL token. With the whole-token logout denylist this meant an
+    // immediate re-login after logout returned the just-denylisted token. authorize() now adds a unique jti
+    // nonce, so every issued token is distinct (and still a valid RS256 token) regardless of timing/payload.
+    void it('issues a UNIQUE token on each call for an identical payload (jti nonce)', () => {
+      const payload = { data: { id: 90020, email: 'jti-unique@juice-sh.op' } }
+      const tokenA = security.authorize(payload)
+      const tokenB = security.authorize(payload)
+      assert.notEqual(tokenA, tokenB)
+      // Both must still be genuine, verifiable RS256 tokens...
+      assert.equal(security.verify(tokenA), true)
+      assert.equal(security.verify(tokenB), true)
+      // ...each carries a distinct jti, and the business payload (data) is preserved unchanged.
+      const decodedA: any = security.decode(tokenA)
+      const decodedB: any = security.decode(tokenB)
+      assert.equal(typeof decodedA.jti, 'string')
+      assert.equal(typeof decodedB.jti, 'string')
+      assert.notEqual(decodedA.jti, decodedB.jti)
+      assert.equal(decodedA.data.email, 'jti-unique@juice-sh.op')
+      // The caller's payload object must NOT be mutated by the nonce injection (it is stored in authenticatedUsers).
+      assert.equal(Object.prototype.hasOwnProperty.call(payload, 'jti'), false)
+    })
+
+    // Regression for QA Issue #2: model the exact login -> logout -> immediate relogin sequence at the helper
+    // level. The first token is denylisted by invalidate(); a re-issued token for the SAME payload must NOT be
+    // denylisted (it is a different token thanks to the jti nonce) and must verify successfully.
+    void it('re-issued token after invalidate() of an identical-payload token is NOT denylisted', () => {
+      const payload = { data: { id: 90021, email: 'jti-relogin@juice-sh.op' } }
+      const first = security.authorize(payload)
+      assert.equal(security.verify(first), true)
+      security.invalidate(first) // logout
+      assert.equal(security.verify(first), false)
+      const second = security.authorize(payload) // immediate relogin, same payload
+      assert.notEqual(first, second)
+      assert.equal(security.isTokenBlocked(second), false)
+      assert.equal(security.verify(second), true)
+    })
   })
 
   void describe('isAuthorized (production middleware enforces RS256, expiry and denylist)', () => {

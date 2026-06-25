@@ -16,10 +16,12 @@ let knownEmail: string
 let logoutEmail: string
 let registryLogoutEmail: string
 let saveLoginIpLogoutEmail: string
+let reloginEmail: string
 const knownPassword = 'Sup3rStr0ngPass1'
 const logoutPassword = 'An0therStr0ngPass1'
 const registryLogoutPassword = 'Th1rdStr0ngPass1'
 const saveLoginIpLogoutPassword = 'F0urthStr0ngPass1'
+const reloginPassword = 'F1fthStr0ngPass1'
 const jsonHeader = { 'content-type': 'application/json' }
 
 // [Security Fix] Broken Authentication — SC1 forged/expired JWT fixtures (reused verbatim from
@@ -45,6 +47,10 @@ before(async () => {
   // A DEDICATED account used only by the saveLoginIp-path logout test below, so its token is never
   // shared with another logout test (see the iat-granularity note above for why dedicated accounts are used).
   saveLoginIpLogoutEmail = `authsecfix.savelogoutip@${domain}`
+  // A DEDICATED account for the QA Issue #2 relogin test. This test deliberately logs the SAME account in,
+  // out, and immediately back in within the same second to prove the jti-nonce fix: re-login now returns a
+  // fresh, non-denylisted token even though the dedicated-account workaround above is no longer required.
+  reloginEmail = `authsecfix.relogin@${domain}`
   // Assert all seed registrations succeed (HTTP 201) before the suites run, so any setup breakage
   // surfaces here with an actionable diagnostic instead of as confusing downstream login failures.
   const knownRegistration = await request(app)
@@ -67,6 +73,11 @@ before(async () => {
     .set(jsonHeader)
     .send({ email: saveLoginIpLogoutEmail, password: saveLoginIpLogoutPassword })
   assert.equal(saveLoginIpLogoutRegistration.status, 201)
+  const reloginRegistration = await request(app)
+    .post('/api/Users')
+    .set(jsonHeader)
+    .send({ email: reloginEmail, password: reloginPassword })
+  assert.equal(reloginRegistration.status, 201)
 }, { timeout: 60000 })
 
 void describe('[Security Fix] Broken Authentication - login (hashing + enumeration)', () => {
@@ -182,6 +193,44 @@ void describe('[Security Fix] Broken Authentication - server-side logout (token 
 
     const afterLogout = await request(app).get('/api/Addresss').set(authHeader)
     assert.equal(afterLogout.status, 401)
+  })
+})
+
+void describe('[Security Fix] Broken Authentication - immediate relogin after logout (QA Issue #2)', () => {
+  // QA Issue #2: jsonwebtoken@0.4.0 builds the token from payload + a second-granularity iat with no random
+  // component, so the SAME account logging in twice within one second used to get a BYTE-IDENTICAL token.
+  // login -> POST /rest/user/logout -> immediate relogin therefore returned the just-denylisted token, and
+  // protected routes rejected the legitimately re-logged-in user with 401 until the next second.
+  // The authorize() jti nonce makes every issued token unique, so the relogin token is fresh and usable.
+  void it('returns a fresh, usable (non-denylisted) token on immediate relogin within the same second', async () => {
+    const firstLogin = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: reloginEmail, password: reloginPassword })
+    assert.equal(firstLogin.status, 200)
+    const firstToken = firstLogin.body.authentication.token
+    assert.equal(typeof firstToken, 'string')
+
+    // Log out (denylists firstToken)...
+    const logoutRes = await request(app).post('/rest/user/logout').set({ Authorization: `Bearer ${firstToken}` })
+    assert.equal(logoutRes.status, 200)
+    // ...the old token is now rejected.
+    const oldTokenReuse = await request(app).get('/api/Addresss').set({ Authorization: `Bearer ${firstToken}` })
+    assert.equal(oldTokenReuse.status, 401)
+
+    // Immediately relog in as the SAME account (typically within the same second).
+    const secondLogin = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: reloginEmail, password: reloginPassword })
+    assert.equal(secondLogin.status, 200)
+    const secondToken = secondLogin.body.authentication.token
+    assert.equal(typeof secondToken, 'string')
+
+    // The relogin token MUST be distinct from the denylisted one (jti nonce) AND usable on a protected route.
+    assert.notEqual(secondToken, firstToken)
+    const reloginUse = await request(app).get('/api/Addresss').set({ Authorization: `Bearer ${secondToken}` })
+    assert.equal(reloginUse.status, 200)
   })
 })
 
