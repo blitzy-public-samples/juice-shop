@@ -14,6 +14,12 @@ import * as models from '../models/index'
 import { type User } from '../data/types'
 import * as utils from '../lib/utils'
 
+// [SECURITY FIX] Broken Authentication
+// Issue: When no user matched the email, the costly password comparison was skipped, so unknown-email logins returned faster than known-email logins.
+// Risk: User enumeration via a timing side channel (CWE-204) — an attacker can distinguish registered from unregistered emails by response latency.
+// Fix: Compare against this constant bcrypt hash for absent users so the bcrypt cost is paid on every login attempt, equalizing response time. It is a valid cost-12 hash that matches no real password.
+const DUMMY_PASSWORD_HASH = '$2a$12$612ixziRINdVgTOh5gS4uuFTCXorVbbI1zyH/fnVy4XC932MWIBVe'
+
 // vuln-code-snippet start loginAdminChallenge loginBenderChallenge loginJimChallenge
 export function login () {
   function afterLogin (user: User, res: Response, next: NextFunction) {
@@ -31,10 +37,15 @@ export function login () {
 
   return (req: Request, res: Response, next: NextFunction) => {
     verifyPreLoginChallenges(req) // vuln-code-snippet hide-line
-    models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND password = '${security.hash(req.body.password || '')}' AND deletedAt IS NULL`, { model: UserModel, plain: true }) // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge
+    models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND deletedAt IS NULL`, { model: UserModel, plain: true }) // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge
       .then((authenticatedUser) => { // vuln-code-snippet neutral-line loginAdminChallenge loginBenderChallenge loginJimChallenge
         const user = utils.queryResultToJson(authenticatedUser)
-        if (user.data?.id && user.data.totpSecret !== '') {
+        // [SECURITY FIX] Broken Authentication
+        // Issue: The password was matched as an MD5 hash embedded in the raw SQL query; passwords are now bcrypt-stored, and the no-user path skipped the comparison.
+        // Risk: CWE-327/CWE-916 (weak/incorrect MD5 verification) and CWE-204 (user enumeration via timing) — credential weakness plus reconnaissance enabling targeted attacks.
+        // Fix: Select the user by email only, then verify the supplied password against the stored bcrypt hash with security.comparePassword; for an absent user, compare against a constant dummy hash so timing is equalized. The failure message stays generic.
+        const passwordMatches = security.comparePassword(req.body.password || '', user.data?.password ?? DUMMY_PASSWORD_HASH)
+        if (user.data?.id && passwordMatches && user.data.totpSecret !== '') {
           res.status(401).json({
             status: 'totp_token_required',
             data: {
@@ -44,7 +55,7 @@ export function login () {
               })
             }
           })
-        } else if (user.data?.id) {
+        } else if (user.data?.id && passwordMatches) {
           afterLogin(user.data, res, next)
         } else {
           res.status(401).send(res.__('Invalid email or password.'))

@@ -1,0 +1,339 @@
+/*
+ * Copyright (c) 2014-2026 Bjoern Kimminich & the OWASP Juice Shop contributors.
+ * SPDX-License-Identifier: MIT
+ */
+
+import { describe, it, before } from 'node:test'
+import assert from 'node:assert/strict'
+import request from 'supertest'
+import type { Express } from 'express'
+import config from 'config'
+import { createTestApp } from './helpers/setup'
+
+let app: Express
+let domain: string
+let knownEmail: string
+let logoutEmail: string
+let registryLogoutEmail: string
+let saveLoginIpLogoutEmail: string
+let reloginEmail: string
+const knownPassword = 'Sup3rStr0ngPass1'
+const logoutPassword = 'An0therStr0ngPass1'
+const registryLogoutPassword = 'Th1rdStr0ngPass1'
+const saveLoginIpLogoutPassword = 'F0urthStr0ngPass1'
+const reloginPassword = 'F1fthStr0ngPass1'
+const jsonHeader = { 'content-type': 'application/json' }
+
+// [Security Fix] Broken Authentication — SC1 forged/expired JWT fixtures (reused verbatim from
+// test/server/authSecurityFix.unit.test.ts). The hardened verify() pins RS256, so each of these MUST be
+// rejected with HTTP 401 when presented to a protected route at the API layer:
+//  - algNoneToken: an unsigned alg=none token (exp far in the future) — rejected because alg !== 'RS256'.
+//  - hs256ForgedToken: an HS256 token signed with the PUBLIC RSA key (algorithm-confusion) — rejected because alg !== 'RS256'.
+//  - expiredRs256Token: a genuine RS256 token (valid signature against encryptionkeys/jwt.pub) whose exp is in the past — rejected for expiry.
+const algNoneToken = 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJkYXRhIjp7ImVtYWlsIjoiand0bjNkQGp1aWNlLXNoLm9wIn0sImlhdCI6MTUwODYzOTYxMiwiZXhwIjo5OTk5OTk5OTk5fQ.'
+const hs256ForgedToken = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRhIjp7ImVtYWlsIjoicnNhX2xvcmRAanVpY2Utc2gub3AifSwiaWF0IjoxNTgyMjIxNTc1fQ.ycFwtqh4ht4Pq9K5rhiPPY256F9YCTIecd4FHFuSEAg'
+const expiredRs256Token = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImVtYWlsIjoiZXhwaXJlZC1yczI1NkBqdWljZS1zaC5vcCJ9LCJpYXQiOjE1OTk5OTAwMDAsImV4cCI6MTYwMDAwMDAwMH0.QB7--MuNcXpbyJ3OeG1Bp0v1z_mKV1XA_rgWPYJdoz0HJ1p2y86hRtbKG-tZQuYRLfQfIfb2_QIquQiy7fzEPJgNB-GTYStYa0gnzn0tUFUk-o1KrDe0LefHvQC7U_FBx3Qx7HXFWRer4L0pvgmlhgcE4FJWLyk2s6cH4izm6ew'
+
+before(async () => {
+  const result = await createTestApp()
+  app = result.app
+  domain = config.get<string>('application.domain')
+  knownEmail = `authsecfix.known@${domain}`
+  logoutEmail = `authsecfix.logout@${domain}`
+  // A DEDICATED account, used only by the appendUserId-gated logout test below, so its token is never
+  // shared with another logout test. (JWT `iat` is second-granular, so the same user logging in twice within
+  // the same second yields the SAME token; a dedicated account guarantees a distinct, non-denylisted token.)
+  registryLogoutEmail = `authsecfix.registrylogout@${domain}`
+  // A DEDICATED account used only by the saveLoginIp-path logout test below, so its token is never
+  // shared with another logout test (see the iat-granularity note above for why dedicated accounts are used).
+  saveLoginIpLogoutEmail = `authsecfix.savelogoutip@${domain}`
+  // A DEDICATED account for the QA Issue #2 relogin test. This test deliberately logs the SAME account in,
+  // out, and immediately back in within the same second to prove the jti-nonce fix: re-login now returns a
+  // fresh, non-denylisted token even though the dedicated-account workaround above is no longer required.
+  reloginEmail = `authsecfix.relogin@${domain}`
+  // Assert all seed registrations succeed (HTTP 201) before the suites run, so any setup breakage
+  // surfaces here with an actionable diagnostic instead of as confusing downstream login failures.
+  const knownRegistration = await request(app)
+    .post('/api/Users')
+    .set(jsonHeader)
+    .send({ email: knownEmail, password: knownPassword })
+  assert.equal(knownRegistration.status, 201)
+  const logoutRegistration = await request(app)
+    .post('/api/Users')
+    .set(jsonHeader)
+    .send({ email: logoutEmail, password: logoutPassword })
+  assert.equal(logoutRegistration.status, 201)
+  const registryLogoutRegistration = await request(app)
+    .post('/api/Users')
+    .set(jsonHeader)
+    .send({ email: registryLogoutEmail, password: registryLogoutPassword })
+  assert.equal(registryLogoutRegistration.status, 201)
+  const saveLoginIpLogoutRegistration = await request(app)
+    .post('/api/Users')
+    .set(jsonHeader)
+    .send({ email: saveLoginIpLogoutEmail, password: saveLoginIpLogoutPassword })
+  assert.equal(saveLoginIpLogoutRegistration.status, 201)
+  const reloginRegistration = await request(app)
+    .post('/api/Users')
+    .set(jsonHeader)
+    .send({ email: reloginEmail, password: reloginPassword })
+  assert.equal(reloginRegistration.status, 201)
+}, { timeout: 60000 })
+
+void describe('[Security Fix] Broken Authentication - login (hashing + enumeration)', () => {
+  void it('accepts correct credentials and returns a JWT', async () => {
+    const res = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: knownEmail, password: knownPassword })
+
+    assert.equal(res.status, 200)
+    assert.equal(typeof res.body.authentication.token, 'string')
+  })
+
+  void it('rejects a wrong password with 401 and the generic message', async () => {
+    const res = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: knownEmail, password: 'definitely-not-the-password' })
+
+    assert.equal(res.status, 401)
+    assert.ok(res.text.includes('Invalid email or password'))
+  })
+
+  void it('rejects an unknown email with the SAME 401 response (no user enumeration)', async () => {
+    const wrongPasswordRes = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: knownEmail, password: 'definitely-not-the-password' })
+
+    const unknownEmailRes = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: `authsecfix.nobody@${domain}`, password: 'definitely-not-the-password' })
+
+    assert.equal(unknownEmailRes.status, 401)
+    assert.equal(unknownEmailRes.status, wrongPasswordRes.status)
+    assert.equal(unknownEmailRes.text, wrongPasswordRes.text)
+  })
+})
+
+void describe('[Security Fix] Broken Authentication - security question (no enumeration)', () => {
+  void it('returns the same { question } shape for a known and an unknown email', async () => {
+    const knownRes = await request(app)
+      .get(`/rest/user/security-question?email=jim@${domain}`)
+    const unknownRes = await request(app)
+      .get('/rest/user/security-question?email=authsecfix.unknown@unknown-us.er')
+
+    assert.equal(knownRes.status, 200)
+    assert.equal(unknownRes.status, 200)
+
+    assert.ok(knownRes.body.question)
+    assert.equal(typeof knownRes.body.question.question, 'string')
+
+    assert.ok(unknownRes.body.question)
+    assert.equal(typeof unknownRes.body.question.question, 'string')
+  })
+
+  void it('returns a deterministic decoy question for the same unknown email', async () => {
+    const first = await request(app)
+      .get('/rest/user/security-question?email=authsecfix.stable@unknown-us.er')
+    const second = await request(app)
+      .get('/rest/user/security-question?email=authsecfix.stable@unknown-us.er')
+
+    assert.equal(first.status, 200)
+    assert.equal(second.status, 200)
+    assert.deepEqual(first.body, second.body)
+  })
+})
+
+void describe('[Security Fix] Broken Authentication - server-side logout (token invalidation)', () => {
+  void it('rejects a token reused after logout with 401', async () => {
+    const loginRes = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: logoutEmail, password: logoutPassword })
+    assert.equal(loginRes.status, 200)
+    const token = loginRes.body.authentication.token
+    assert.equal(typeof token, 'string')
+
+    const authHeader = { Authorization: `Bearer ${token}` }
+
+    const beforeLogout = await request(app).get('/api/Users').set(authHeader)
+    assert.equal(beforeLogout.status, 200)
+
+    const logoutRes = await request(app).post('/rest/user/logout').set(authHeader)
+    assert.equal(logoutRes.status, 200)
+
+    const afterLogout = await request(app).get('/api/Users').set(authHeader)
+    assert.equal(afterLogout.status, 401)
+  })
+
+  void it('rejects a logged-out token on an appendUserId-gated route (registry read path) with 401', async () => {
+    // GET /api/Addresss is gated ONLY by security.appendUserId() (server.ts), so its authentication is
+    // enforced solely by the registry read path hardened for finding #3 (appendUserId -> authenticatedUsers.get()).
+    // This exercises that specific path end-to-end through the real middleware stack.
+    const loginRes = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: registryLogoutEmail, password: registryLogoutPassword })
+    assert.equal(loginRes.status, 200)
+    const token = loginRes.body.authentication.token
+    assert.equal(typeof token, 'string')
+
+    const authHeader = { Authorization: `Bearer ${token}` }
+
+    // While authenticated, the appendUserId-gated route resolves the user from the registry and returns 200.
+    const beforeLogout = await request(app).get('/api/Addresss').set(authHeader)
+    assert.equal(beforeLogout.status, 200)
+
+    // After logout the token is denylisted and evicted, so the registry read (get()) refuses it -> 401.
+    const logoutRes = await request(app).post('/rest/user/logout').set(authHeader)
+    assert.equal(logoutRes.status, 200)
+
+    const afterLogout = await request(app).get('/api/Addresss').set(authHeader)
+    assert.equal(afterLogout.status, 401)
+  })
+})
+
+void describe('[Security Fix] Broken Authentication - immediate relogin after logout (QA Issue #2)', () => {
+  // QA Issue #2: jsonwebtoken@0.4.0 builds the token from payload + a second-granularity iat with no random
+  // component, so the SAME account logging in twice within one second used to get a BYTE-IDENTICAL token.
+  // login -> POST /rest/user/logout -> immediate relogin therefore returned the just-denylisted token, and
+  // protected routes rejected the legitimately re-logged-in user with 401 until the next second.
+  // The authorize() jti nonce makes every issued token unique, so the relogin token is fresh and usable.
+  void it('returns a fresh, usable (non-denylisted) token on immediate relogin within the same second', async () => {
+    const firstLogin = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: reloginEmail, password: reloginPassword })
+    assert.equal(firstLogin.status, 200)
+    const firstToken = firstLogin.body.authentication.token
+    assert.equal(typeof firstToken, 'string')
+
+    // Log out (denylists firstToken)...
+    const logoutRes = await request(app).post('/rest/user/logout').set({ Authorization: `Bearer ${firstToken}` })
+    assert.equal(logoutRes.status, 200)
+    // ...the old token is now rejected.
+    const oldTokenReuse = await request(app).get('/api/Addresss').set({ Authorization: `Bearer ${firstToken}` })
+    assert.equal(oldTokenReuse.status, 401)
+
+    // Immediately relog in as the SAME account (typically within the same second).
+    const secondLogin = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: reloginEmail, password: reloginPassword })
+    assert.equal(secondLogin.status, 200)
+    const secondToken = secondLogin.body.authentication.token
+    assert.equal(typeof secondToken, 'string')
+
+    // The relogin token MUST be distinct from the denylisted one (jti nonce) AND usable on a protected route.
+    assert.notEqual(secondToken, firstToken)
+    const reloginUse = await request(app).get('/api/Addresss').set({ Authorization: `Bearer ${secondToken}` })
+    assert.equal(reloginUse.status, 200)
+  })
+})
+
+void describe('[Security Fix] Broken Authentication - logout via saveLoginIp path (client-side UI logout invalidation)', () => {
+  // The unmodified Angular client-side logout() invokes ONLY GET /rest/saveLoginIp (it never calls
+  // POST /rest/user/logout). Per AAP §0.11 the frontend must not be modified, so server-side token
+  // invalidation is performed in the saveLoginIp handler — the endpoint the UI logout already calls —
+  // making the existing client-side logout actually "backed by the new server-side invalidation"
+  // (AAP §0.9.2). This reproduces the real UI logout flow at the API-contract level (QA C5 Finding #1):
+  // a token captured from a session must be rejected (401) once the saveLoginIp logout path has run.
+  void it('invalidates the presented token after GET /rest/saveLoginIp so reuse is rejected with 401', async () => {
+    const loginRes = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: saveLoginIpLogoutEmail, password: saveLoginIpLogoutPassword })
+    assert.equal(loginRes.status, 200)
+    const token = loginRes.body.authentication.token
+    assert.equal(typeof token, 'string')
+
+    const authHeader = { Authorization: `Bearer ${token}` }
+
+    // While authenticated, the protected route returns 200.
+    const beforeLogout = await request(app).get('/api/Users').set(authHeader)
+    assert.equal(beforeLogout.status, 200)
+
+    // The UI logout calls GET /rest/saveLoginIp; it still succeeds (200) AND now denylists the token.
+    const saveLoginIpRes = await request(app)
+      .get('/rest/saveLoginIp')
+      .set(authHeader)
+    assert.equal(saveLoginIpRes.status, 200)
+
+    // After the saveLoginIp logout path, the same token is rejected with 401 on a protected route.
+    const afterLogout = await request(app).get('/api/Users').set(authHeader)
+    assert.equal(afterLogout.status, 401)
+  })
+})
+
+void describe('[Security Fix] Broken Authentication - change password requires current password', () => {
+  void it('rejects a password change that omits the current password with 401', async () => {
+    const loginRes = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: knownEmail, password: knownPassword })
+    assert.equal(loginRes.status, 200)
+    const token = loginRes.body.authentication.token
+
+    const res = await request(app)
+      .get('/rest/user/change-password?new=BrandNewPass123&repeat=BrandNewPass123')
+      .set({ Authorization: `Bearer ${token}` })
+
+    assert.equal(res.status, 401)
+  })
+})
+
+void describe('[Security Fix] Broken Authentication - JWT rejection at the API layer (SC1)', () => {
+  // GET /api/Users is gated by security.isAuthorized() (server.ts), so presenting a forged or expired
+  // token MUST be rejected with HTTP 401 and MUST NOT return the user collection (no successful access).
+  const protectedRoute = '/api/Users'
+
+  void it('rejects an alg=none (unsigned) forged token with 401 on a protected route', async () => {
+    const res = await request(app)
+      .get(protectedRoute)
+      .set({ Authorization: `Bearer ${algNoneToken}` })
+
+    assert.equal(res.status, 401)
+    assert.equal(Array.isArray(res.body.data), false)
+  })
+
+  void it('rejects an HS256 token signed with the public RSA key (algorithm confusion) with 401', async () => {
+    const res = await request(app)
+      .get(protectedRoute)
+      .set({ Authorization: `Bearer ${hs256ForgedToken}` })
+
+    assert.equal(res.status, 401)
+    assert.equal(Array.isArray(res.body.data), false)
+  })
+
+  void it('rejects an expired RS256 token (valid signature, exp in the past) with 401', async () => {
+    const res = await request(app)
+      .get(protectedRoute)
+      .set({ Authorization: `Bearer ${expiredRs256Token}` })
+
+    assert.equal(res.status, 401)
+    assert.equal(Array.isArray(res.body.data), false)
+  })
+
+  void it('issues fresh login tokens whose lifetime (exp - iat) does not exceed one hour', async () => {
+    const loginRes = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: knownEmail, password: knownPassword })
+    assert.equal(loginRes.status, 200)
+
+    const token = loginRes.body.authentication.token
+    assert.equal(typeof token, 'string')
+
+    // Decode the JWT payload (middle segment) at the API layer and verify the issued lifetime is <= 1 hour.
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')) as { iat: number, exp: number }
+    assert.equal(typeof payload.iat, 'number')
+    assert.equal(typeof payload.exp, 'number')
+
+    const lifetimeSeconds = payload.exp - payload.iat
+    assert.ok(lifetimeSeconds > 0)
+    assert.ok(lifetimeSeconds <= 3600)
+  })
+})

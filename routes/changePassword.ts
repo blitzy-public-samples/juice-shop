@@ -36,7 +36,11 @@ export function changePassword () {
       return
     }
 
-    if (currentPassword && security.hash(currentPassword) !== loggedInUser.data.password) {
+    // [SECURITY FIX] Broken Authentication
+    // Issue: The current password was verified with unsalted MD5 (security.hash), and the entire check was skipped when currentPassword was empty/missing.
+    // Risk: CWE-327/CWE-916 (weak hash) and CWE-620/CWE-306 (missing re-authentication) — an attacker with a hijacked session/token could change the password without knowing the current one, enabling account takeover.
+    // Fix: Require currentPassword and verify it against the stored bcrypt hash via security.comparePassword.
+    if (!currentPassword || !security.comparePassword(currentPassword, loggedInUser.data.password)) {
       res.status(401).send(res.__('Current password is not correct.'))
       return
     }
