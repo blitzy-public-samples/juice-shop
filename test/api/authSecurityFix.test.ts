@@ -15,9 +15,11 @@ let domain: string
 let knownEmail: string
 let logoutEmail: string
 let registryLogoutEmail: string
+let saveLoginIpLogoutEmail: string
 const knownPassword = 'Sup3rStr0ngPass1'
 const logoutPassword = 'An0therStr0ngPass1'
 const registryLogoutPassword = 'Th1rdStr0ngPass1'
+const saveLoginIpLogoutPassword = 'F0urthStr0ngPass1'
 const jsonHeader = { 'content-type': 'application/json' }
 
 // [Security Fix] Broken Authentication — SC1 forged/expired JWT fixtures (reused verbatim from
@@ -40,6 +42,9 @@ before(async () => {
   // shared with another logout test. (JWT `iat` is second-granular, so the same user logging in twice within
   // the same second yields the SAME token; a dedicated account guarantees a distinct, non-denylisted token.)
   registryLogoutEmail = `authsecfix.registrylogout@${domain}`
+  // A DEDICATED account used only by the saveLoginIp-path logout test below, so its token is never
+  // shared with another logout test (see the iat-granularity note above for why dedicated accounts are used).
+  saveLoginIpLogoutEmail = `authsecfix.savelogoutip@${domain}`
   // Assert all seed registrations succeed (HTTP 201) before the suites run, so any setup breakage
   // surfaces here with an actionable diagnostic instead of as confusing downstream login failures.
   const knownRegistration = await request(app)
@@ -57,6 +62,11 @@ before(async () => {
     .set(jsonHeader)
     .send({ email: registryLogoutEmail, password: registryLogoutPassword })
   assert.equal(registryLogoutRegistration.status, 201)
+  const saveLoginIpLogoutRegistration = await request(app)
+    .post('/api/Users')
+    .set(jsonHeader)
+    .send({ email: saveLoginIpLogoutEmail, password: saveLoginIpLogoutPassword })
+  assert.equal(saveLoginIpLogoutRegistration.status, 201)
 }, { timeout: 60000 })
 
 void describe('[Security Fix] Broken Authentication - login (hashing + enumeration)', () => {
@@ -171,6 +181,40 @@ void describe('[Security Fix] Broken Authentication - server-side logout (token 
     assert.equal(logoutRes.status, 200)
 
     const afterLogout = await request(app).get('/api/Addresss').set(authHeader)
+    assert.equal(afterLogout.status, 401)
+  })
+})
+
+void describe('[Security Fix] Broken Authentication - logout via saveLoginIp path (client-side UI logout invalidation)', () => {
+  // The unmodified Angular client-side logout() invokes ONLY GET /rest/saveLoginIp (it never calls
+  // POST /rest/user/logout). Per AAP §0.11 the frontend must not be modified, so server-side token
+  // invalidation is performed in the saveLoginIp handler — the endpoint the UI logout already calls —
+  // making the existing client-side logout actually "backed by the new server-side invalidation"
+  // (AAP §0.9.2). This reproduces the real UI logout flow at the API-contract level (QA C5 Finding #1):
+  // a token captured from a session must be rejected (401) once the saveLoginIp logout path has run.
+  void it('invalidates the presented token after GET /rest/saveLoginIp so reuse is rejected with 401', async () => {
+    const loginRes = await request(app)
+      .post('/rest/user/login')
+      .set(jsonHeader)
+      .send({ email: saveLoginIpLogoutEmail, password: saveLoginIpLogoutPassword })
+    assert.equal(loginRes.status, 200)
+    const token = loginRes.body.authentication.token
+    assert.equal(typeof token, 'string')
+
+    const authHeader = { Authorization: `Bearer ${token}` }
+
+    // While authenticated, the protected route returns 200.
+    const beforeLogout = await request(app).get('/api/Users').set(authHeader)
+    assert.equal(beforeLogout.status, 200)
+
+    // The UI logout calls GET /rest/saveLoginIp; it still succeeds (200) AND now denylists the token.
+    const saveLoginIpRes = await request(app)
+      .get('/rest/saveLoginIp')
+      .set(authHeader)
+    assert.equal(saveLoginIpRes.status, 200)
+
+    // After the saveLoginIp logout path, the same token is rejected with 401 on a protected route.
+    const afterLogout = await request(app).get('/api/Users').set(authHeader)
     assert.equal(afterLogout.status, 401)
   })
 })
